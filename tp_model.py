@@ -163,7 +163,6 @@ class TPCausalSelfAttention(nn.Module):
         k = k.view(batch_size, block_size, n_head, n_embd // n_head).transpose(1, 2)
         v = v.view(batch_size, block_size, n_head, n_embd // n_head).transpose(1, 2)
 
-        # Compute causal self attention
         # (batch_size, n_head, block_size, n_embd / n_head / mesh.size)
         # * (batch_size, n_head, n_embd / n_head / mesh.size, block_size)
         # -> (batch_size, n_head, block_size, block_size)
