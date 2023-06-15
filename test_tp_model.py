@@ -60,33 +60,34 @@ config = GPTConfig(
 
 
 def collective_with_count(
+    device_mesh: DeviceMesh,
     orig_collective: Callable,
     counter: Counter,
     *args,
     **kwargs,
 ):
     counter[orig_collective] += 1
-    return orig_collective(*args, **kwargs)
+    return orig_collective(device_mesh, *args, **kwargs)
 
 
 @contextlib.contextmanager
 def patch_device_mesh_all_reduce(new_all_reduce: Callable):
-    _orig_all_reduce = torch.distributed._tensor.device_mesh.all_reduce
-    torch.distributed._tensor.device_mesh.all_reduce = new_all_reduce
+    _orig_all_reduce = torch.distributed._tensor.device_mesh.DeviceMesh.all_reduce
+    torch.distributed._tensor.device_mesh.DeviceMesh.all_reduce = new_all_reduce
     try:
         yield
     finally:
-        torch.distributed._tensor.device_mesh.all_reduce = _orig_all_reduce
+        torch.distributed._tensor.device_mesh.DeviceMesh.all_reduce = _orig_all_reduce
 
 
 @contextlib.contextmanager
 def patch_device_mesh_all_gather(new_all_gather: Callable):
-    _orig_all_gather = torch.distributed._tensor.device_mesh.all_gather
-    torch.distributed._tensor.device_mesh.all_gather = new_all_gather
+    _orig_all_gather = torch.distributed._tensor.device_mesh.DeviceMesh.all_gather
+    torch.distributed._tensor.device_mesh.DeviceMesh.all_gather = new_all_gather
     try:
         yield
     finally:
-        torch.distributed._tensor.device_mesh.all_gather = _orig_all_gather
+        torch.distributed._tensor.device_mesh.DeviceMeshall_gather = _orig_all_gather
 
 
 def _check_cuda() -> None:
@@ -123,7 +124,10 @@ def _init_values(module: nn.Module, tp_module: nn.Module, mesh: DeviceMesh) -> N
     for m1, m2 in zip(module.modules(), tp_module.modules()):
         if isinstance(m1, CausalSelfAttention):
             assert isinstance(m2, (TPCausalSelfAttention, CausalSelfAttention))
-            (m2.c_attn.weight, m2.c_attn.bias,) = _init_qkv_params_from_tensors(
+            (
+                m2.c_attn.weight,
+                m2.c_attn.bias,
+            ) = _init_qkv_params_from_tensors(
                 src_weight=m1.c_attn.weight,
                 src_bias=m1.c_attn.bias,
                 dst_weight=m2.c_attn.weight,
@@ -157,6 +161,7 @@ def _get_gpt_inp() -> Tuple[torch.Tensor]:
 
 
 def _check_tp_forward(
+    device_mesh: DeviceMesh,
     module: nn.Module,
     tp_module: nn.Module,
     expected_num_all_reduces: int,
@@ -173,13 +178,13 @@ def _check_tp_forward(
     inp = get_input_fn()
     out = module(*inp)
     counter = Counter()
-    orig_all_reduce = torch.distributed._tensor.device_mesh.all_reduce
-    orig_all_gather = torch.distributed._tensor.device_mesh.all_gather
+    orig_all_reduce = torch.distributed._tensor.device_mesh.DeviceMesh.all_reduce
+    orig_all_gather = torch.distributed._tensor.device_mesh.DeviceMesh.all_gather
     all_reduce_with_count = functools.partial(
-        collective_with_count, orig_all_reduce, counter
+        collective_with_count, device_mesh, orig_all_reduce, counter
     )
     all_gather_with_count = functools.partial(
-        collective_with_count, orig_all_gather, counter
+        collective_with_count, device_mesh, orig_all_gather, counter
     )
     with patch_device_mesh_all_reduce(
         all_reduce_with_count
@@ -201,7 +206,7 @@ def test_tp_self_attn_module(config: GPTConfig):
     tp_self_attn = TPCausalSelfAttention(config, device_mesh).cuda()
     self_attn = CausalSelfAttention(config).cuda()
     _init_values(self_attn, tp_self_attn, device_mesh)
-    _check_tp_forward(self_attn, tp_self_attn, 1, 0, _get_block_inp)
+    _check_tp_forward(device_mesh, self_attn, tp_self_attn, 1, 0, _get_block_inp)
     dist.barrier()
     if dist.get_rank() == 0:
         print(f"Passed test_tp_self_attn_module!")
@@ -219,7 +224,7 @@ def test_tp_self_attn_parallelize(config: GPTConfig):
         CausalSelfAttention(config).cuda(), device_mesh
     )
     _init_values(self_attn, tp_self_attn, device_mesh)
-    _check_tp_forward(self_attn, tp_self_attn, 1, 0, _get_block_inp)
+    _check_tp_forward(device_mesh, self_attn, tp_self_attn, 1, 0, _get_block_inp)
     dist.barrier()
     if dist.get_rank() == 0:
         print(f"Passed test_tp_self_attn_parallelize!")
@@ -232,7 +237,7 @@ def test_tp_mlp_module(config: GPTConfig):
     tp_mlp = TPMLP(config, device_mesh).cuda()
     mlp = MLP(config).cuda()
     _init_values(mlp, tp_mlp, device_mesh)
-    _check_tp_forward(mlp, tp_mlp, 1, 0, _get_block_inp)
+    _check_tp_forward(device_mesh, mlp, tp_mlp, 1, 0, _get_block_inp)
     dist.barrier()
     if dist.get_rank() == 0:
         print(f"Passed test_tp_mlp_module!")
@@ -245,7 +250,7 @@ def test_tp_mlp_parallelize(config: GPTConfig):
     mlp = MLP(config).cuda()
     tp_mlp = parallelize_mlp(MLP(config).cuda(), device_mesh)
     _init_values(mlp, tp_mlp, device_mesh)
-    _check_tp_forward(mlp, tp_mlp, 1, 0, _get_block_inp)
+    _check_tp_forward(device_mesh, mlp, tp_mlp, 1, 0, _get_block_inp)
     dist.barrier()
     if dist.get_rank() == 0:
         print(f"Passed test_tp_mlp_parallelize!")
@@ -258,7 +263,7 @@ def test_tp_block_module(config: GPTConfig):
     tp_block = TPBlock(config, device_mesh).cuda()
     block = Block(config).cuda()
     _init_values(block, tp_block, device_mesh)
-    _check_tp_forward(block, tp_block, 2, 0, _get_block_inp)
+    _check_tp_forward(device_mesh, block, tp_block, 2, 0, _get_block_inp)
     dist.barrier()
     if dist.get_rank() == 0:
         print(f"Passed test_tp_block_module!")
@@ -271,7 +276,7 @@ def test_tp_block_parallelize(config: GPTConfig):
     block = Block(config).cuda()
     tp_block = parallelize_block(Block(config).cuda(), device_mesh)
     _init_values(block, tp_block, device_mesh)
-    _check_tp_forward(block, tp_block, 2, 0, _get_block_inp)
+    _check_tp_forward(device_mesh, block, tp_block, 2, 0, _get_block_inp)
     dist.barrier()
     if dist.get_rank() == 0:
         print(f"Passed test_tp_block_parallelize!")
@@ -284,7 +289,9 @@ def test_tp_gpt_parallelize(config: GPTConfig):
     tp_gpt = parallelize_gpt(GPT(config).cuda(), device_mesh)
     _init_values(gpt, tp_gpt, device_mesh)
     expected_num_all_reduce = config.n_layer * 2
-    _check_tp_forward(gpt, tp_gpt, expected_num_all_reduce, 0, _get_gpt_inp)
+    _check_tp_forward(
+        device_mesh, gpt, tp_gpt, expected_num_all_reduce, 0, _get_gpt_inp
+    )
     dist.barrier()
     if dist.get_rank() == 0:
         print(f"Passed test_tp_gpt_parallelize!")
