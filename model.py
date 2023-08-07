@@ -11,9 +11,137 @@ import inspect
 import math
 from dataclasses import dataclass
 
+from typing import List, Optional, Tuple
+
 import torch
+import torch.distributed as dist
 import torch.nn as nn
+
+from torch.distributed._tensor import DeviceMesh, distribute_tensor, DTensor, Shard
 from torch.nn import functional as F
+
+
+class SoftMoE(nn.Module):
+    def __init__(
+        self,
+        # Only pass in this rank's experts
+        experts: List[nn.Module],
+        n_embd: int,
+        n_slots: int,
+        device: Optional[torch.device] = None,
+        device_mesh: Optional[DeviceMesh] = None,
+        expert_dim: Optional[int] = None,
+    ):
+        super().__init__()
+        if device_mesh is not None and not isinstance(device_mesh, DeviceMesh):
+            raise ValueError(f"Invalid device mesh: {device_mesh}")
+        self.device_mesh = device_mesh
+        self.expert_dim = expert_dim
+        self.expert_world_size = (
+            self.device_mesh.size(expert_dim) if device_mesh is not None else 1
+        )
+        self.expert_pg = (
+            device_mesh.get_dim_groups(expert_dim) if device_mesh is not None else None
+        )
+        self.expert_rank = self.expert_pg.rank() if device_mesh is not None else 0
+        self.n_experts = len(experts) * self.expert_world_size
+        self.experts = nn.ModuleList(experts)
+        self.n_embd = n_embd
+        self.n_slots = n_slots
+        self.weight = nn.Parameter(
+            torch.empty((n_embd, self.n_experts * n_slots), device=device)
+        )
+        self.reset_parameters()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Expert parallelism: shard S on expert dim for computing D, X_, Y_.
+        - Option 1: All-gather Y_ along expert dim with two `.contiguous()`
+          copies for permuting batch and expert dims.
+        - Option 2: Compute C as replicated; shard immediately; compute partial
+          Y; and all-reduce.
+        We prefer option 1 for now due to lower communication cost.
+        """
+        if x.ndim != 3:
+            raise ValueError(f"Expects 3D input but got {x.shape}")
+        rank = self.expert_rank if self._is_expert_parallel else 0
+        world_size = self.expert_world_size if self._is_expert_parallel else 1
+        X = x  # (B, T, n_embd)
+        Phi = self.weight  # (n_embd, n_experts * n_slots)
+        S = X @ Phi  # (B, T, n_experts * n_slots)
+
+        # Shard softmax over sequences along expert dim
+        assert S.size(-1) == self.n_experts * self.n_slots, f"S: {S.shape}"
+        shard_size = S.size(-1) // world_size
+        S_shard = S[
+            :, :, rank * shard_size : (rank + 1) * shard_size
+        ]  # (B, T, n_experts * n_slots / P)
+        D_shard = F.softmax(S_shard, dim=-2)  # (B, T, n_experts * n_slots / P)
+        D = D_shard
+        X_ = D.transpose(-1, -2) @ X  # (B, n_experts * n_slots / P, n_embd)
+        X_is = torch.chunk(
+            X_, self.n_experts // world_size, dim=-2
+        )  # (B, n_slots, n_embd) * n_experts / P
+        # NOTE: Assume each expert preserves dimensionality to pre-allocate;
+        # otherwise, require the out dim as an arg (e.g. to constructor)
+        Y_ = torch.empty_like(X_)  # (B, n_experts * n_slots / P, n_embd)
+        for i, expert in enumerate(self.experts):
+            Y_[:, i * self.n_slots : (i + 1) * self.n_slots] = expert(X_is[i])
+        # work = None
+        if self._is_expert_parallel:
+            Y_T = Y_.transpose(
+                0, 1
+            ).contiguous()  # (n_experts * n_slots / P, B, n_embd); copy
+            # Y_out_ = torch.empty(
+            #     (Y_.numel() * world_size,), dtype=Y_.dtype, device=Y_.device
+            # )
+            Y_out_ = _AllGather.apply(
+                Y_T.view(-1), self.expert_pg
+            )  # (n_experts * n_slots, B, n_embd)
+            # work = dist.all_gather_into_tensor(
+            #     Y_out_, Y_T.view(-1), group=self.expert_pg, async_op=True
+            # )
+        C = F.softmax(S, dim=-1)  # (B, T, n_experts * n_slots)
+        if self._is_expert_parallel:
+            # work.wait()
+            Y_ = (
+                Y_out_.view(Y_T.size(0) * world_size, Y_T.size(1), Y_T.size(2))
+                .transpose(0, 1)
+                .contiguous()
+            )  # (B, n_experts * n_slots, n_embd); copy
+        Y = C @ Y_  # (B, T, n_embd)
+        return Y
+
+    def reset_parameters(self):
+        torch.nn.init.normal_(self.weight, mean=0.0, std=0.02)
+
+    @property
+    def _is_expert_parallel(self) -> bool:
+        return self.device_mesh is not None
+
+
+class _AllGather(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, inp: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
+        if inp.ndim != 1:
+            raise ValueError(f"Expects input to be 1D but got {inp.shape}")
+        ctx.group = group
+        out = torch.empty(
+            (inp.numel() * group.size(),), dtype=inp.dtype, device=inp.device
+        )
+        dist.all_gather_into_tensor(out, inp, group=group)
+        return out
+
+    def backward(ctx, grad_out: torch.Tensor) -> Tuple[torch.Tensor, None]:
+        assert grad_out.ndim == 1, f"{grad_out.shape}"
+        group = ctx.group
+        grad_in = torch.empty(
+            (grad_out.numel() // group.size(),),
+            dtype=grad_out.dtype,
+            device=grad_out.device,
+        )
+        dist.reduce_scatter_tensor(grad_in, grad_out, group=group)
+        return grad_in, None
 
 
 class LayerNorm(nn.Module):
@@ -132,6 +260,43 @@ class Block(nn.Module):
         return x
 
 
+class SoftMoEBlock(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        assert config.moe_config is not None
+        moe_config = config.moe_config
+        if moe_config.device_mesh is not None:
+            assert moe_config.expert_dim <= moe_config.device_mesh.ndim
+            expert_world_size = moe_config.device_mesh.size(moe_config.expert_dim)
+            assert moe_config.n_experts % expert_world_size == 0
+        else:
+            expert_world_size = 1
+        self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+        # Only construct 1/P-many experts on this rank (if distributed)
+        self.moe = SoftMoE(
+            [MLP(config) for _ in range(moe_config.n_experts // expert_world_size)],
+            config.n_embd,
+            moe_config.n_slots,
+            device_mesh=moe_config.device_mesh,
+            expert_dim=moe_config.expert_dim,
+        )
+
+    def forward(self, x):
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.moe(self.ln_2(x))
+        return x
+
+
+@dataclass
+class SoftMoEConfig:
+    n_experts: int = 16
+    n_slots: int = 1
+    device_mesh: Optional[DeviceMesh] = None
+    expert_dim: int = -1
+
+
 @dataclass
 class GPTConfig:
     block_size: int = 1024
@@ -141,6 +306,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True  # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    moe_config: Optional[SoftMoEConfig] = None
 
 
 class GPT(nn.Module):
@@ -150,12 +316,22 @@ class GPT(nn.Module):
         assert config.block_size is not None
         self.config = config
 
+        blocks = (
+            [Block(config) for _ in range(config.n_layer)]
+            if not self._use_moe
+            else [Block(config) for _ in range(config.n_layer // 2)]
+            + [
+                SoftMoEBlock(config)
+                for _ in range(config.n_layer - config.n_layer // 2)
+            ]
+        )
+
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
                 wpe=nn.Embedding(config.block_size, config.n_embd),
                 drop=nn.Dropout(config.dropout),
-                h=nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+                h=nn.ModuleList(blocks),
                 ln_f=LayerNorm(config.n_embd, bias=config.bias),
             )
         )
@@ -393,3 +569,7 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+    @property
+    def _use_moe(self) -> bool:
+        return self.config.moe_config is not None

@@ -1,6 +1,6 @@
 """
 This training script can be run both on a single gpu in debug mode,
-and also in a larger training run with distributed data parallel (ddp).
+and also in a larger training run with distributed data parallel (is_distributed).
 
 To run on a single GPU, example:
 $ python train.py --batch_size=32 --compile=False
@@ -25,8 +25,10 @@ from contextlib import nullcontext
 import numpy as np
 import torch
 
-from model import GPT, GPTConfig
+from model import Block, GPT, GPTConfig, SoftMoEConfig
 from torch.distributed import destroy_process_group, init_process_group
+from torch.distributed._composable import checkpoint
+from torch.distributed._tensor import DeviceMesh
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 # -----------------------------------------------------------------------------
@@ -45,7 +47,7 @@ wandb_project = "owt"
 wandb_run_name = "gpt2"  # 'run' + str(time.time())
 # data
 dataset = "openwebtext"
-gradient_accumulation_steps = 5 * 8  # used to simulate larger batch sizes
+gradient_accumulation_steps = 4  # used to simulate larger batch sizes
 batch_size = 12  # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
@@ -54,6 +56,10 @@ n_head = 12
 n_embd = 768
 dropout = 0.0  # for pretraining 0 is good, for finetuning try 0.1+
 bias = False  # do we use bias inside LayerNorm and Linear layers?
+checkpoint_activations = False
+n_experts = 8
+n_slots = 1
+use_moe = False
 # adamw optimizer
 learning_rate = 6e-4  # max learning rate
 max_iters = 600000  # total number of training iterations
@@ -87,29 +93,69 @@ config_keys = [
 exec(open("configurator.py").read())  # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys}  # will be useful for logging
 # -----------------------------------------------------------------------------
+torch.cuda.memory._record_memory_history(
+    True, trace_alloc_max_entries=100000, trace_alloc_record_context=True
+)
+# -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
-ddp = int(os.environ.get("RANK", -1)) != -1  # is this a ddp run?
-if ddp:
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ["RANK"])
-    ddp_local_rank = int(os.environ["LOCAL_RANK"])
-    ddp_world_size = int(os.environ["WORLD_SIZE"])
-    device = f"cuda:{ddp_local_rank}"
+is_distributed = int(os.environ.get("RANK", -1)) != -1  # is this a is_distributed run?
+if is_distributed:
+    # init_process_group(backend=backend)
+    global_rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    global_world_size = int(os.environ["WORLD_SIZE"])
+    if use_moe:
+        # TODO: Hard code data parallel dimension (dim-0) as size 1
+        device_mesh = DeviceMesh(
+            "cuda",
+            torch.arange(
+                global_world_size,
+            ).view(1, -1),
+        )
+        if global_rank == 0:
+            print(f"Initialized device mesh: {device_mesh}")
+        dp_dim = 0
+        expert_dim = 1
+        dp_pg = device_mesh.get_dim_groups(dp_dim)
+        dp_rank = dp_pg.rank()
+        dp_world_size = device_mesh.size(dp_dim)
+    else:
+        init_process_group(backend=backend)
+        device_mesh = None
+        dp_pg = torch.distributed.distributed_c10d._get_default_group()
+        dp_rank = dp_pg.rank()
+        dp_world_size = global_world_size
+    device = f"cuda:{local_rank}"
     torch.cuda.set_device(device)
-    master_process = ddp_rank == 0  # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank  # each process gets a different seed
+    master_process = (
+        global_rank == 0
+    )  # this process will do logging, checkpointing etc.
+    seed_offset = dp_rank  # each data parallel worker gets a different seed
     # world_size number of processes will be training simultaneously, so we can scale
     # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
+    assert (
+        gradient_accumulation_steps % dp_world_size == 0
+    ), f"gradient_accumulation_step={gradient_accumulation_steps} dp_world_size={dp_world_size}"
+    gradient_accumulation_steps //= dp_world_size
 else:
-    # if not ddp, we are running on a single gpu, and one process
+    # if not is_distributed, we are running on a single gpu, and one process
     master_process = True
     seed_offset = 0
-    ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
+    global_world_size = 1
+    device_mesh = None
+    expert_dim = -1
+    dp_world_size = 1
+if use_moe:
+    moe_config = SoftMoEConfig(n_experts, n_slots, device_mesh, expert_dim)
+else:
+    moe_config = None
+tokens_per_iter = gradient_accumulation_steps * dp_world_size * batch_size * block_size
+print(
+    f"tokens per iteration will be: {tokens_per_iter:,} "
+    f"(dp_world_size={dp_world_size}, grad_acc_steps={gradient_accumulation_steps}, "
+    f"batch_size={batch_size}, block_size={block_size})"
+)
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
@@ -179,6 +225,7 @@ model_args = dict(
     bias=bias,
     vocab_size=None,
     dropout=dropout,
+    moe_config=moe_config,
 )  # start with model_args from command line
 if init_from == "scratch":
     # init a new model from scratch
@@ -228,6 +275,10 @@ if block_size < model.config.block_size:
     model_args[
         "block_size"
     ] = block_size  # so that the checkpoint will have the right value
+if checkpoint_activations:
+    for module in model.modules():
+        if isinstance(module, Block):
+            checkpoint(module)
 model.to(device)
 
 # initialize a GradScaler. If enabled=False scaler is a no-op
@@ -247,9 +298,14 @@ if compile:
     unoptimized_model = model
     model = torch.compile(model)  # requires PyTorch 2.0
 
+if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+    print(f"Model ({sum([p.numel() for p in model.parameters()])} numel): {model}")
+
 # wrap model into DDP container
-if ddp:
-    model = DDP(model, device_ids=[ddp_local_rank])
+if is_distributed:
+    model = DDP(model, device_ids=[local_rank], process_group=dp_pg)
+    if master_process:
+        print(f"Initialized with DDP over group of size {dp_pg.size()}!")
 
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
@@ -294,8 +350,9 @@ if wandb_log and master_process:
 X, Y = get_batch("train")  # fetch the very first batch
 t0 = time.time()
 local_iter_num = 0  # number of iterations in the lifetime of this process
-raw_model = model.module if ddp else model  # unwrap DDP container if needed
+raw_model = model.module if is_distributed else model  # unwrap DDP container if needed
 running_mfu = -1.0
+
 while True:
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -303,66 +360,95 @@ while True:
         param_group["lr"] = lr
 
     # evaluate the loss on train/val sets and write checkpoints
-    if iter_num % eval_interval == 0 and master_process:
+    if iter_num % eval_interval == 0:
         losses = estimate_loss()
-        print(
-            f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
-        )
-        if wandb_log:
-            wandb.log(
-                {
-                    "iter": iter_num,
-                    "train/loss": losses["train"],
-                    "val/loss": losses["val"],
-                    "lr": lr,
-                    "mfu": running_mfu * 100,  # convert to percentage
-                }
+        if master_process:
+            print(
+                f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
             )
-        if losses["val"] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses["val"]
-            if iter_num > 0:
-                checkpoint = {
-                    "model": raw_model.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "model_args": model_args,
-                    "iter_num": iter_num,
-                    "best_val_loss": best_val_loss,
-                    "config": config,
-                }
-                print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
+            if wandb_log:
+                wandb.log(
+                    {
+                        "iter": iter_num,
+                        "train/loss": losses["train"],
+                        "val/loss": losses["val"],
+                        "lr": lr,
+                        "mfu": running_mfu * 100,  # convert to percentage
+                    }
+                )
+            if losses["val"] < best_val_loss or always_save_checkpoint:
+                best_val_loss = losses["val"]
+                if iter_num > 0:
+                    checkpoint = {
+                        "model": raw_model.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "model_args": model_args,
+                        "iter_num": iter_num,
+                        "best_val_loss": best_val_loss,
+                        "config": config,
+                    }
+                    print(f"saving checkpoint to {out_dir}")
+                    torch.save(checkpoint, os.path.join(out_dir, "ckpt.pt"))
     if iter_num == 0 and eval_only:
         break
 
-    # forward backward update, with optional gradient accumulation to simulate larger batch size
-    # and using the GradScaler if data type is float16
-    for micro_step in range(gradient_accumulation_steps):
-        if ddp:
-            # in DDP training we only need to sync gradients at the last micro step.
-            # the official way to do this is with model.no_sync() context manager, but
-            # I really dislike that this bloats the code and forces us to repeat code
-            # looking at the source of that context manager, it just toggles this variable
-            model.require_backward_grad_sync = (
-                micro_step == gradient_accumulation_steps - 1
-            )
-        with ctx:
-            logits, loss = model(X, Y)
+    wait, warmup, active = 0, 0, 1
+    num_steps = wait + warmup + active
+    with nullcontext():
+        # with torch.profiler.profile(
+        #     activities=[
+        #         torch.profiler.ProfilerActivity.CPU,
+        #         torch.profiler.ProfilerActivity.CUDA,
+        #     ],
+        #     schedule=torch.profiler.schedule(
+        #         wait=wait, warmup=warmup, active=active, repeat=1, skip_first=0
+        #     ),
+        #     on_trace_ready=torch.profiler.tensorboard_trace_handler("profiles")
+        #     if master_process else None,
+        #     record_shapes=True,
+        #     profile_memory=True,
+        #     with_stack=True,  # incurs an additional overhead; disable if not needed
+        #     with_flops=True,
+        #     with_modules=False,  # only for torchscript models at the moment
+        #     experimental_config=torch.profiler._ExperimentalConfig(
+        #         enable_cuda_sync_events=True
+        #     ),
+        # ) as prof:
+        # forward backward update, with optional gradient accumulation to simulate larger batch size
+        # and using the GradScaler if data type is float16
+        for micro_step in range(gradient_accumulation_steps):
+            if is_distributed:
+                # in DDP training we only need to sync gradients at the last micro step.
+                # the official way to do this is with model.no_sync() context manager, but
+                # I really dislike that this bloats the code and forces us to repeat code
+                # looking at the source of that context manager, it just toggles this variable
+                model.require_backward_grad_sync = (
+                    micro_step == gradient_accumulation_steps - 1
+                )
+            with ctx:
+                logits, loss = model(X, Y)
             loss = (
                 loss / gradient_accumulation_steps
             )  # scale the loss to account for gradient accumulation
-        # immediately async prefetch next batch while model is doing the forward pass on the GPU
-        X, Y = get_batch("train")
-        # backward pass, with gradient scaling if training in fp16
-        scaler.scale(loss).backward()
-    # clip the gradient
-    if grad_clip != 0.0:
-        scaler.unscale_(optimizer)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-    # step the optimizer and scaler if training in fp16
-    scaler.step(optimizer)
-    scaler.update()
-    # flush the gradients as soon as we can, no need for this memory anymore
-    optimizer.zero_grad(set_to_none=True)
+            # immediately async prefetch next batch while model is doing the forward pass on the GPU
+            X, Y = get_batch("train")
+            # backward pass, with gradient scaling if training in fp16
+            scaler.scale(loss).backward()
+        # clip the gradient
+        if grad_clip != 0.0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+        # step the optimizer and scaler if training in fp16
+        scaler.step(optimizer)
+        scaler.update()
+        if iter_num == 3 and master_process:
+            snapshot = torch.cuda.memory._snapshot()
+            with open(f"snapshot_{iter_num}.pickle", "wb") as f:
+                pickle.dump(snapshot, f)
+        # flush the gradients as soon as we can, no need for this memory anymore
+        optimizer.zero_grad(set_to_none=True)
+        # if master_process:
+        #     prof.step()
 
     # timing and logging
     t1 = time.time()
@@ -375,8 +461,11 @@ while True:
         if local_iter_num >= 5:  # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9 * running_mfu + 0.1 * mfu
+        mem_stats = torch.cuda.memory_stats()
+        peak_active_gb = mem_stats["active_bytes.all.peak"] / (1024**3)
+        peak_reserved_gb = mem_stats["reserved_bytes.all.peak"] / (1024**3)
         print(
-            f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%"
+            f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}% | peak active: {peak_active_gb} GB | peak reserved: {peak_reserved_gb} GB"
         )
     iter_num += 1
     local_iter_num += 1
@@ -385,5 +474,5 @@ while True:
     if iter_num > max_iters:
         break
 
-if ddp:
+if is_distributed:
     destroy_process_group()
